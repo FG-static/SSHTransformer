@@ -1,6 +1,6 @@
 # SSHTransformer
 
-局域网双机剪贴板 / 文件互传。Mac 版 MVP。
+局域网双机剪贴板 / 文件互传（macOS / Linux）。
 
 ## 功能
 
@@ -11,14 +11,17 @@
 
 ## 要求
 
-- macOS
-- Python 3.10+（推荐 Homebrew `python3`）
+- macOS 或 Linux
+- Python 3.10+
+- Linux 系统剪贴板（任选其一）：
+  - Wayland：`wl-clipboard`（`wl-copy` / `wl-paste`）
+  - X11：`xclip` 或 `xsel`
 
 ## 安装与启动
 
 ```bash
 cd SSHTransformer
-/opt/homebrew/bin/python3 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python run.py
@@ -50,4 +53,4 @@ Open WebUI →  http://127.0.0.1:8765
 ## 说明
 
 - 默认假设两机在同一局域网；跨网请自行用 Tailscale 等组网，主机地址填虚拟网 IP。
-- 当前为 Mac 优先实现（系统剪贴板使用 `pbcopy` / `pbpaste`）。
+- 系统剪贴板会按平台自动选择：macOS 用 `pbcopy`/`pbpaste`；Linux 优先 `wl-clipboard`，否则 `xclip`/`xsel`。

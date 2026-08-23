@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from . import clipboard as clip
+from .clipboard import ClipboardError
 from .network import list_lan_ips, local_identity
 from .state import Phase, Role, PeerInfo, state
 
@@ -219,8 +220,8 @@ def set_clipboard(body: ClipboardBody) -> dict:
 def clipboard_from_system() -> dict:
     try:
         text = clip.read_clipboard()
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Read clipboard failed: {exc}") from exc
+    except ClipboardError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     state.set_clipboard(text)
     return {"ok": True, "text": text, "updated_at": state.clipboard_updated_at}
 
@@ -231,8 +232,8 @@ def clipboard_to_system() -> dict:
         text = state.clipboard_text
     try:
         clip.write_clipboard(text)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Write clipboard failed: {exc}") from exc
+    except ClipboardError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {"ok": True}
 
 
