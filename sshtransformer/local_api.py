@@ -46,6 +46,11 @@ def _peer_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _lan_client(timeout: float | None) -> httpx.Client:
+    """Create a direct client for peer traffic without desktop proxy settings."""
+    return httpx.Client(timeout=timeout, trust_env=False)
+
+
 def enriched_status() -> dict:
     snap = state.snapshot()
     snap["ips"] = list_lan_ips()
@@ -125,7 +130,7 @@ def connect_guest(body: ConnectBody) -> dict:
 
     url = f"http://{host}:{PEER_PORT}/pair"
     try:
-        with httpx.Client(timeout=8.0) as client:
+        with _lan_client(timeout=8.0) as client:
             resp = client.post(
                 url,
                 json={
@@ -247,7 +252,7 @@ def clipboard_push() -> dict:
         target = state.peer_base_url
 
     try:
-        with httpx.Client(timeout=10.0) as client:
+        with _lan_client(timeout=10.0) as client:
             resp = client.put(f"{target}/clipboard", json={"text": text}, headers=_peer_headers())
             if resp.status_code >= 400:
                 raise HTTPException(status_code=400, detail=resp.text)
@@ -266,7 +271,7 @@ def clipboard_pull() -> dict:
         target = state.peer_base_url
 
     try:
-        with httpx.Client(timeout=10.0) as client:
+        with _lan_client(timeout=10.0) as client:
             resp = client.get(f"{target}/clipboard", headers=_peer_headers())
             if resp.status_code >= 400:
                 raise HTTPException(status_code=400, detail=resp.text)
@@ -299,7 +304,7 @@ def transfer_file(body: TransferBody) -> dict:
         if not src.is_file():
             raise HTTPException(status_code=400, detail=f"Source not found: {src}")
         try:
-            with httpx.Client(timeout=None) as client:
+            with _lan_client(timeout=None) as client:
                 with src.open("rb") as f:
                     resp = client.post(
                         f"{target}/file",
@@ -322,7 +327,7 @@ def transfer_file(body: TransferBody) -> dict:
         return {"ok": True, "direction": "send", "source": str(src), "dest": dest}
 
     try:
-        with httpx.Client(timeout=None) as client:
+        with _lan_client(timeout=None) as client:
             resp = client.get(
                 f"{target}/file/fetch",
                 params={"path": body.source_path},
