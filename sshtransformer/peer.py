@@ -140,6 +140,40 @@ async def receive_file(
     return {"ok": True, "dest": str(dest_path)}
 
 
+class MkdirBody(BaseModel):
+    path: str
+
+
+@router.post("/mkdir")
+def make_dir(body: MkdirBody, authorization: str | None = Header(default=None)) -> dict:
+    _require_token(authorization)
+    dest_path = Path(body.path).expanduser()
+    try:
+        dest_path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"Cannot create directory: {exc}") from exc
+    return {"ok": True, "path": str(dest_path)}
+
+
+@router.get("/dir/list")
+def list_dir(path: str, authorization: str | None = Header(default=None)) -> dict:
+    _require_token(authorization)
+    from .transfer_ops import list_tree
+
+    src = Path(path).expanduser()
+    if not src.exists():
+        raise HTTPException(status_code=404, detail=f"Path not found: {src}")
+    if src.is_file():
+        return {"ok": True, "kind": "file", "root": str(src), "name": src.name, "files": [src.name], "dirs": []}
+    if not src.is_dir():
+        raise HTTPException(status_code=400, detail=f"Not a directory: {src}")
+    try:
+        tree = list_tree(src)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "kind": "dir", **tree}
+
+
 @router.get("/file/fetch")
 def fetch_file(path: str, authorization: str | None = Header(default=None)) -> FileResponse:
     _require_token(authorization)

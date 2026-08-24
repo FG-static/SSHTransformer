@@ -393,7 +393,11 @@
                 ? logs
                     .map((item) => {
                       const label = item.action === "send" ? "发送" : "接收";
-                      return `<li>${escapeHtml(label)} · ${escapeHtml(item.source || item.name || "")} → ${escapeHtml(item.dest || "")}</li>`;
+                      const count =
+                        typeof item.files === "number" && item.files > 1
+                          ? ` · ${item.files} 个文件`
+                          : "";
+                      return `<li>${escapeHtml(label)} · ${escapeHtml(item.source || item.name || "")} → ${escapeHtml(item.dest || "")}${escapeHtml(count)}</li>`;
                     })
                     .join("")
                 : "<li>暂无传输记录</li>"
@@ -569,7 +573,7 @@
       const btn = document.getElementById("btn-transfer");
       btn.disabled = true;
       try {
-        await api("/transfer", {
+        const result = await api("/transfer", {
           method: "POST",
           body: JSON.stringify({
             source_path,
@@ -577,7 +581,11 @@
             direction: transferDirection,
           }),
         });
-        toast("传输完成");
+        if (result.kind === "dir") {
+          toast(`文件夹传输完成（${result.files || 0} 个文件）`);
+        } else {
+          toast("传输完成");
+        }
         status = await api("/status");
         renderReady(status);
         renderEndpoints(status);

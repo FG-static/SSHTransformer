@@ -14,6 +14,7 @@ from . import history as path_history
 from .network import list_lan_ips, local_identity
 from .picker import PickerCancelled, PickerError, pick_path, picker_available
 from .state import Phase, Role, PeerInfo, state
+from .transfer_ops import iter_local_dirs, iter_local_files, normalize_dest_dir
 
 router = APIRouter(prefix="/api")
 
@@ -336,22 +337,46 @@ def transfer_file(body: TransferBody) -> dict:
         target = state.peer_base_url
 
     src = Path(body.source_path).expanduser()
-    dest = body.dest_path
+    dest = body.dest_path.strip()
+    headers = _peer_headers()
 
     if direction == "send":
-        if not src.is_file():
-            raise HTTPException(status_code=400, detail=f"Source not found: {src}")
+        return _send_path(src, dest, target, headers)
+    return _receive_path(body.source_path, dest, target, headers)
+
+
+def _peer_error(resp: httpx.Response) -> str:
+    try:
+        data = resp.json()
+        detail = data.get("detail")
+        if detail is not None:
+            detail_s = str(detail)
+        else:
+            detail_s = resp.text or f"HTTP {resp.status_code}"
+    except Exception:  # noqa: BLE001
+        detail_s = resp.text or f"HTTP {resp.status_code}"
+
+    if resp.status_code == 404:
+        return (
+            f"{detail_s}（对端可能还是旧版本，文件夹传输需要两端都更新并重启；"
+            "若刚更新过，请确认对端已 git pull 后重新 python run.py）"
+        )
+    return detail_s
+
+
+def _send_path(src: Path, dest: str, target: str, headers: dict[str, str]) -> dict:
+    if src.is_file():
         try:
             with _lan_client(timeout=None) as client:
                 with src.open("rb") as f:
                     resp = client.post(
                         f"{target}/file",
-                        headers=_peer_headers(),
+                        headers=headers,
                         files={"file": (src.name, f)},
                         data={"dest": dest},
                     )
                 if resp.status_code >= 400:
-                    raise HTTPException(status_code=400, detail=resp.text)
+                    raise HTTPException(status_code=400, detail=_peer_error(resp))
         except HTTPException:
             raise
         except OSError as exc:
@@ -359,26 +384,152 @@ def transfer_file(body: TransferBody) -> dict:
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=400, detail=f"Transfer failed: {exc}") from exc
 
-        state.add_transfer_log(
-            {"action": "send", "source": str(src), "dest": dest, "ok": True}
-        )
+        state.add_transfer_log({"action": "send", "source": str(src), "dest": dest, "ok": True})
         path_history.remember_paths((str(src), "local"), (dest, "remote"))
-        return {"ok": True, "direction": "send", "source": str(src), "dest": dest}
+        return {
+            "ok": True,
+            "direction": "send",
+            "kind": "file",
+            "source": str(src),
+            "dest": dest,
+            "files": 1,
+        }
+
+    if not src.is_dir():
+        raise HTTPException(status_code=400, detail=f"Source not found: {src}")
+
+    remote_root = normalize_dest_dir(dest, src.name)
+    files = iter_local_files(src)
+    dirs = iter_local_dirs(src)
 
     try:
         with _lan_client(timeout=None) as client:
-            resp = client.get(
-                f"{target}/file/fetch",
-                params={"path": body.source_path},
-                headers=_peer_headers(),
+            root_resp = client.post(
+                f"{target}/mkdir",
+                headers=headers,
+                json={"path": str(remote_root)},
             )
-            if resp.status_code >= 400:
-                raise HTTPException(status_code=400, detail=resp.text)
-            dest_path = Path(dest).expanduser()
-            if dest_path.exists() and dest_path.is_dir():
-                dest_path = dest_path / Path(body.source_path).name
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            dest_path.write_bytes(resp.content)
+            if root_resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail=_peer_error(root_resp))
+
+            for rel in dirs:
+                resp = client.post(
+                    f"{target}/mkdir",
+                    headers=headers,
+                    json={"path": str(remote_root / rel)},
+                )
+                if resp.status_code >= 400:
+                    raise HTTPException(status_code=400, detail=_peer_error(resp))
+
+            for file_path, rel in files:
+                remote_dest = str(remote_root / rel)
+                with file_path.open("rb") as f:
+                    resp = client.post(
+                        f"{target}/file",
+                        headers=headers,
+                        files={"file": (file_path.name, f)},
+                        data={"dest": remote_dest},
+                    )
+                if resp.status_code >= 400:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{rel}: {_peer_error(resp)}",
+                    )
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=400, detail=f"Transfer failed: {exc}") from exc
+
+    state.add_transfer_log(
+        {
+            "action": "send",
+            "source": str(src),
+            "dest": str(remote_root),
+            "ok": True,
+            "files": len(files),
+        }
+    )
+    path_history.remember_paths((str(src), "local"), (str(remote_root), "remote"))
+    return {
+        "ok": True,
+        "direction": "send",
+        "kind": "dir",
+        "source": str(src),
+        "dest": str(remote_root),
+        "files": len(files),
+        "dirs": len(dirs),
+    }
+
+
+def _receive_path(source_path: str, dest: str, target: str, headers: dict[str, str]) -> dict:
+    try:
+        with _lan_client(timeout=None) as client:
+            listed = client.get(
+                f"{target}/dir/list",
+                params={"path": source_path},
+                headers=headers,
+            )
+            if listed.status_code >= 400:
+                raise HTTPException(status_code=400, detail=_peer_error(listed))
+            meta = listed.json()
+
+            if meta.get("kind") == "file":
+                resp = client.get(
+                    f"{target}/file/fetch",
+                    params={"path": source_path},
+                    headers=headers,
+                )
+                if resp.status_code >= 400:
+                    raise HTTPException(status_code=400, detail=_peer_error(resp))
+                dest_path = Path(dest).expanduser()
+                if (dest_path.exists() and dest_path.is_dir()) or str(dest).endswith(("/", "\\")):
+                    dest_path = dest_path / Path(source_path).name
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                dest_path.write_bytes(resp.content)
+                state.add_transfer_log(
+                    {
+                        "action": "receive",
+                        "source": source_path,
+                        "dest": str(dest_path),
+                        "ok": True,
+                    }
+                )
+                path_history.remember_paths((source_path, "remote"), (str(dest_path), "local"))
+                return {
+                    "ok": True,
+                    "direction": "receive",
+                    "kind": "file",
+                    "source": source_path,
+                    "dest": str(dest_path),
+                    "files": 1,
+                }
+
+            remote_name = meta.get("name") or Path(source_path).name
+            local_root = normalize_dest_dir(dest, remote_name)
+            local_root.mkdir(parents=True, exist_ok=True)
+
+            for rel in meta.get("dirs") or []:
+                (local_root / rel).mkdir(parents=True, exist_ok=True)
+
+            files = meta.get("files") or []
+            remote_root = Path(meta.get("root") or source_path)
+            for rel in files:
+                remote_file = str(remote_root / rel)
+                resp = client.get(
+                    f"{target}/file/fetch",
+                    params={"path": remote_file},
+                    headers=headers,
+                )
+                if resp.status_code >= 400:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{rel}: {_peer_error(resp)}",
+                    )
+                out = local_root / rel
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(resp.content)
     except HTTPException:
         raise
     except OSError as exc:
@@ -389,10 +540,19 @@ def transfer_file(body: TransferBody) -> dict:
     state.add_transfer_log(
         {
             "action": "receive",
-            "source": body.source_path,
-            "dest": str(dest_path),
+            "source": source_path,
+            "dest": str(local_root),
             "ok": True,
+            "files": len(files),
         }
     )
-    path_history.remember_paths((body.source_path, "remote"), (str(dest_path), "local"))
-    return {"ok": True, "direction": "receive", "source": body.source_path, "dest": str(dest_path)}
+    path_history.remember_paths((source_path, "remote"), (str(local_root), "local"))
+    return {
+        "ok": True,
+        "direction": "receive",
+        "kind": "dir",
+        "source": source_path,
+        "dest": str(local_root),
+        "files": len(files),
+        "dirs": len(meta.get("dirs") or []),
+    }
