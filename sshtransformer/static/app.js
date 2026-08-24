@@ -6,8 +6,42 @@
   let status = null;
   let selectedIp = "";
   let transferDirection = "send";
+  let savedSrcPath = "";
+  let savedDestPath = "";
   let pollTimer = null;
   let toastTimer = null;
+
+  function basename(path) {
+    const parts = String(path || "")
+      .replaceAll("\\", "/")
+      .split("/")
+      .filter(Boolean);
+    return parts[parts.length - 1] || "file";
+  }
+
+  function joinPath(root, name) {
+    const r = String(root || "").replace(/\/+$/, "");
+    const n = String(name || "").replace(/^\/+/, "");
+    return `${r}/${n}`;
+  }
+
+  function historyOptions(paths, selected) {
+    const list = paths || [];
+    if (!list.length) {
+      return `<option value="">暂无历史记录</option>`;
+    }
+    return [
+      `<option value="">从历史记录选择…</option>`,
+      ...list.map(
+        (p) =>
+          `<option value="${escapeHtml(p)}" ${p === selected ? "selected" : ""}>${escapeHtml(p)}</option>`
+      ),
+    ].join("");
+  }
+
+  function datalistOptions(paths) {
+    return (paths || []).map((p) => `<option value="${escapeHtml(p)}"></option>`).join("");
+  }
 
   async function api(path, options = {}) {
     const res = await fetch(`/api${path}`, {
@@ -200,16 +234,26 @@
   }
 
   function renderGuestForm(s) {
+    const hosts = s.host_history || [];
+    const lastHost = hosts[0] || "";
     app.innerHTML = `
       <section class="view" style="max-width:520px;margin:2rem auto 0">
         <div class="panel">
           <h2>连接主机</h2>
-          <p class="sub">输入主机在等待页展示的局域网 IP 与六位配对码。</p>
+          <p class="sub">输入主机在等待页展示的局域网 IP 与六位配对码。成功连接过的主机会记在本地，可直接下拉选择。</p>
           <form class="form-grid" id="connect-form">
             <label>
               主机 IP
-              <input name="host" placeholder="例如 192.168.1.8" required autocomplete="off" />
+              <input id="host-input" name="host" list="host-datalist" placeholder="例如 192.168.1.8" required autocomplete="off" value="${escapeHtml(lastHost)}" />
             </label>
+            <datalist id="host-datalist">${datalistOptions(hosts)}</datalist>
+            <select class="history-select" id="host-history">
+              ${
+                hosts.length
+                  ? [`<option value="">从历史主机选择…</option>`, ...hosts.map((ip) => `<option value="${escapeHtml(ip)}">${escapeHtml(ip)}</option>`)].join("")
+                  : `<option value="">暂无历史主机</option>`
+              }
+            </select>
             <label>
               配对码
               <input name="code" placeholder="六位数字" required maxlength="8" autocomplete="off" />
@@ -223,6 +267,14 @@
         </div>
       </section>
     `;
+
+    const hostInput = document.getElementById("host-input");
+    document.getElementById("host-history")?.addEventListener("change", (e) => {
+      if (e.target.value) {
+        hostInput.value = e.target.value;
+      }
+      e.target.selectedIndex = 0;
+    });
 
     document.getElementById("connect-form").addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -256,6 +308,36 @@
 
   function renderReady(s) {
     const logs = (s.transfer_log || []).slice().reverse();
+    const hist = s.path_history || { local: [], remote: [], all: [] };
+    const remoteRoot = s.remote_default_root || "/tmp";
+    const localDir = s.local_default_dir || s.local_home || "";
+    const sending = transferDirection === "send";
+
+    const srcIsLocal = sending;
+    const destIsLocal = !sending;
+    const srcHist = srcIsLocal ? hist.local : hist.remote;
+    const destHist = destIsLocal ? hist.local : hist.remote;
+
+    const srcPlaceholder = sending
+      ? `${localDir || "/Users/you"}/Desktop/notes.txt`
+      : `${remoteRoot}/notes.txt`;
+    const destPlaceholder = sending
+      ? `${remoteRoot}/notes.txt`
+      : `${localDir || "/Users/you"}/notes.txt`;
+
+    const srcActions = srcIsLocal
+      ? `<div class="path-actions">
+           <button class="btn btn-accent btn-compact" id="src-browse-file" type="button">选择文件…</button>
+           <button class="btn btn-ghost btn-compact" id="src-browse-folder" type="button">选择文件夹…</button>
+         </div>`
+      : `<p class="hint">对端路径请手动填写，或从下方历史记录选择</p>`;
+
+    const destActions = destIsLocal
+      ? `<div class="path-actions">
+           <button class="btn btn-accent btn-compact" id="dest-browse-folder" type="button">选择文件夹…</button>
+         </div>`
+      : "";
+
     app.innerHTML = `
       <section class="view ready-grid">
         <div class="panel">
@@ -271,20 +353,35 @@
         </div>
         <div class="panel">
           <h2>文件互传</h2>
-          <p class="sub">填写源路径与目标路径，一键传到对端磁盘。</p>
+          <p class="sub">推送时可选择本机文件或文件夹；接收时选择本机保存文件夹。对端路径会按对方系统预填默认根目录。</p>
           <div class="transfer-fields">
             <div class="dir-toggle" role="group" aria-label="传输方向">
-              <button type="button" data-dir="send" class="${transferDirection === "send" ? "active" : ""}">发送到对端</button>
-              <button type="button" data-dir="receive" class="${transferDirection === "receive" ? "active" : ""}">从对端拉取</button>
+              <button type="button" data-dir="send" class="${sending ? "active" : ""}">发送到对端</button>
+              <button type="button" data-dir="receive" class="${!sending ? "active" : ""}">从对端拉取</button>
             </div>
-            <label>
-              ${transferDirection === "send" ? "本机源路径" : "对端源路径"}
-              <input id="src-path" placeholder="/Users/you/Desktop/notes.txt" />
-            </label>
-            <label>
-              ${transferDirection === "send" ? "对端目标路径" : "本机目标路径"}
-              <input id="dest-path" placeholder="/tmp/notes.txt" />
-            </label>
+            <div class="path-field">
+              <span class="label">${sending ? "本机源路径" : "对端源路径"}</span>
+              <div class="path-row">
+                <input id="src-path" list="src-datalist" placeholder="${escapeHtml(srcPlaceholder)}" autocomplete="off" />
+                ${srcActions}
+              </div>
+              <datalist id="src-datalist">${datalistOptions(srcHist)}</datalist>
+              <select class="history-select" id="src-history">${historyOptions(srcHist, "")}</select>
+            </div>
+            <div class="path-field">
+              <span class="label">${sending ? "对端目标路径" : "本机目标路径"}</span>
+              <div class="path-row">
+                <input id="dest-path" list="dest-datalist" placeholder="${escapeHtml(destPlaceholder)}" autocomplete="off" />
+                ${destActions}
+              </div>
+              <datalist id="dest-datalist">${datalistOptions(destHist)}</datalist>
+              <select class="history-select" id="dest-history">${historyOptions(destHist, "")}</select>
+              <p class="hint">${
+                sending
+                  ? `对端路径默认从 <code>${escapeHtml(remoteRoot)}</code> 起写，选完本机文件后会自动带上文件名`
+                  : `本机默认保存到 <code>${escapeHtml(localDir)}</code>，选文件夹后会自动带上源文件名`
+              }</p>
+            </div>
           </div>
           <div class="btn-row">
             <button class="btn btn-accent" id="btn-transfer" type="button">开始传输</button>
@@ -305,6 +402,89 @@
         </div>
       </section>
     `;
+
+    const srcEl = document.getElementById("src-path");
+    const destEl = document.getElementById("dest-path");
+    if (savedSrcPath) srcEl.value = savedSrcPath;
+    if (savedDestPath) {
+      destEl.value = savedDestPath;
+    } else if (sending) {
+      destEl.value = remoteRoot.replace(/\/+$/, "") + "/";
+    } else {
+      destEl.value = localDir.replace(/\/+$/, "") + "/";
+    }
+
+    const persistPaths = () => {
+      savedSrcPath = srcEl.value;
+      savedDestPath = destEl.value;
+    };
+    srcEl.addEventListener("input", persistPaths);
+    destEl.addEventListener("input", persistPaths);
+
+    document.getElementById("src-history")?.addEventListener("change", (e) => {
+      if (e.target.value) {
+        srcEl.value = e.target.value;
+        persistPaths();
+        if (sending) {
+          destEl.value = joinPath(remoteRoot, basename(srcEl.value));
+          persistPaths();
+        }
+      }
+      e.target.selectedIndex = 0;
+    });
+    document.getElementById("dest-history")?.addEventListener("change", (e) => {
+      if (e.target.value) {
+        destEl.value = e.target.value;
+        persistPaths();
+      }
+      e.target.selectedIndex = 0;
+    });
+
+    async function browse(kind, targetInput, after) {
+      try {
+        const data = await api("/pick", {
+          method: "POST",
+          body: JSON.stringify({ kind }),
+        });
+        if (data.cancelled) {
+          toast("已取消选择");
+          return;
+        }
+        let path = data.path || "";
+        // Finder folder paths usually end with "/"
+        targetInput.value = path;
+        persistPaths();
+        after?.(path);
+        toast("已填入路径");
+      } catch (err) {
+        toast(err.message, true);
+      }
+    }
+
+    function applyRemoteDestFromLocal(path) {
+      if (!sending) return;
+      const name = basename(path);
+      if (!name) {
+        destEl.value = remoteRoot.replace(/\/+$/, "") + "/";
+      } else {
+        destEl.value = joinPath(remoteRoot, name);
+      }
+      persistPaths();
+    }
+
+    document.getElementById("src-browse-file")?.addEventListener("click", () => {
+      browse("file", srcEl, applyRemoteDestFromLocal);
+    });
+    document.getElementById("src-browse-folder")?.addEventListener("click", () => {
+      browse("folder", srcEl, applyRemoteDestFromLocal);
+    });
+    document.getElementById("dest-browse-folder")?.addEventListener("click", () => {
+      browse("folder", destEl, (folder) => {
+        const name = basename(srcEl.value);
+        destEl.value = name ? joinPath(folder, name) : folder.replace(/\/?$/, "/");
+        persistPaths();
+      });
+    });
 
     const clip = document.getElementById("clip-text");
     let saveTimer = null;
@@ -370,20 +550,18 @@
 
     app.querySelectorAll("[data-dir]").forEach((btn) => {
       btn.addEventListener("click", () => {
+        persistPaths();
         transferDirection = btn.getAttribute("data-dir");
-        const src = document.getElementById("src-path")?.value || "";
-        const dest = document.getElementById("dest-path")?.value || "";
+        // Reset dest suggestion when switching direction.
+        savedDestPath = "";
         renderReady(status);
-        const srcEl = document.getElementById("src-path");
-        const destEl = document.getElementById("dest-path");
-        if (srcEl) srcEl.value = src;
-        if (destEl) destEl.value = dest;
       });
     });
 
     document.getElementById("btn-transfer").addEventListener("click", async () => {
-      const source_path = document.getElementById("src-path").value.trim();
-      const dest_path = document.getElementById("dest-path").value.trim();
+      persistPaths();
+      const source_path = srcEl.value.trim();
+      const dest_path = destEl.value.trim();
       if (!source_path || !dest_path) {
         toast("请填写源路径和目标路径", true);
         return;

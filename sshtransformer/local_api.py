@@ -10,7 +10,9 @@ from pydantic import BaseModel, Field
 
 from . import clipboard as clip
 from .clipboard import ClipboardError
+from . import history as path_history
 from .network import list_lan_ips, local_identity
+from .picker import PickerCancelled, PickerError, pick_path, picker_available
 from .state import Phase, Role, PeerInfo, state
 
 router = APIRouter(prefix="/api")
@@ -38,6 +40,10 @@ class TransferBody(BaseModel):
     direction: str = Field(description="send = local→peer, receive = peer→local")
 
 
+class PickBody(BaseModel):
+    kind: str = Field(description='file or folder')
+
+
 def _peer_headers() -> dict[str, str]:
     with state._lock:
         token = state.session_token
@@ -54,6 +60,17 @@ def _lan_client(timeout: float | None) -> httpx.Client:
 def enriched_status() -> dict:
     snap = state.snapshot()
     snap["ips"] = list_lan_ips()
+    peer_os = snap["peer"]["os"] if snap.get("peer") else ""
+    snap["picker_available"] = picker_available()
+    snap["local_home"] = path_history.local_home()
+    snap["local_default_dir"] = path_history.local_default_dir()
+    snap["remote_default_root"] = path_history.default_root_for_os(peer_os)
+    snap["path_history"] = {
+        "local": path_history.history_paths("local"),
+        "remote": path_history.history_paths("remote"),
+        "all": path_history.history_paths(),
+    }
+    snap["host_history"] = path_history.host_ips()
     return snap
 
 
@@ -168,6 +185,7 @@ def connect_guest(body: ConnectBody) -> dict:
         state.phase = Phase.READY
         state.last_error = ""
 
+    path_history.remember_host(host)
     return enriched_status()
 
 
@@ -286,6 +304,26 @@ def clipboard_pull() -> dict:
     return {"ok": True, "text": text, "updated_at": state.clipboard_updated_at}
 
 
+@router.post("/pick")
+def pick_local_path(body: PickBody) -> dict:
+    try:
+        path = pick_path(body.kind)
+    except PickerCancelled:
+        return {"ok": False, "cancelled": True, "path": ""}
+    except PickerError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "cancelled": False, "path": path}
+
+
+@router.get("/path-history")
+def get_path_history() -> dict:
+    return {
+        "local": path_history.history_paths("local"),
+        "remote": path_history.history_paths("remote"),
+        "all": path_history.history_paths(),
+    }
+
+
 @router.post("/transfer")
 def transfer_file(body: TransferBody) -> dict:
     direction = body.direction.strip().lower()
@@ -324,6 +362,7 @@ def transfer_file(body: TransferBody) -> dict:
         state.add_transfer_log(
             {"action": "send", "source": str(src), "dest": dest, "ok": True}
         )
+        path_history.remember_paths((str(src), "local"), (dest, "remote"))
         return {"ok": True, "direction": "send", "source": str(src), "dest": dest}
 
     try:
@@ -336,6 +375,8 @@ def transfer_file(body: TransferBody) -> dict:
             if resp.status_code >= 400:
                 raise HTTPException(status_code=400, detail=resp.text)
             dest_path = Path(dest).expanduser()
+            if dest_path.exists() and dest_path.is_dir():
+                dest_path = dest_path / Path(body.source_path).name
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             dest_path.write_bytes(resp.content)
     except HTTPException:
@@ -353,4 +394,5 @@ def transfer_file(body: TransferBody) -> dict:
             "ok": True,
         }
     )
+    path_history.remember_paths((body.source_path, "remote"), (str(dest_path), "local"))
     return {"ok": True, "direction": "receive", "source": body.source_path, "dest": str(dest_path)}

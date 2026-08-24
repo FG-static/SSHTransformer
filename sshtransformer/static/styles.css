@@ -548,6 +548,53 @@ button.btn:disabled {
   gap: 0.75rem;
 }
 
+.path-field {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.path-field > span.label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.path-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.path-row input {
+  width: 100%;
+  min-width: 0;
+}
+
+.path-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.btn-compact {
+  padding: 0.55rem 0.9rem;
+  white-space: nowrap;
+  font-size: 0.88rem;
+}
+
+.history-select {
+  margin-top: 0.35rem;
+  font-size: 0.82rem;
+  padding: 0.45rem 0.7rem;
+}
+
+.hint {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+  line-height: 1.4;
+}
+
 .dir-toggle {
   display: grid;
   grid-template-columns: 1fr 1fr;
