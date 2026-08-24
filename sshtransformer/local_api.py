@@ -14,7 +14,14 @@ from . import history as path_history
 from .network import list_lan_ips, local_identity
 from .picker import PickerCancelled, PickerError, pick_path, picker_available
 from .state import Phase, Role, PeerInfo, state
-from .transfer_ops import iter_local_dirs, iter_local_files, normalize_dest_dir
+from .transfer_ops import (
+    ProgressReader,
+    iter_local_dirs,
+    iter_local_files,
+    make_transfer_headers,
+    normalize_dest_dir,
+    safe_relative_path,
+)
 
 router = APIRouter(prefix="/api")
 
@@ -78,6 +85,16 @@ def enriched_status() -> dict:
 @router.get("/status")
 def status() -> dict:
     return enriched_status()
+
+
+@router.get("/transfers")
+def transfers() -> dict:
+    """Lightweight fixed-frequency endpoint for transfer progress and logs."""
+    with state._lock:
+        return {
+            "transfers": state.transfer_snapshot(),
+            "transfer_log": list(state.transfer_log[-20:]),
+        }
 
 
 @router.post("/role")
@@ -224,6 +241,8 @@ def reset_session() -> dict:
         state.clipboard_text = ""
         state.clipboard_updated_at = None
         state.transfer_log.clear()
+        state.transfer_tasks.clear()
+        state._transfer_order.clear()
         state.last_error = ""
     return enriched_status()
 
@@ -364,70 +383,223 @@ def _peer_error(resp: httpx.Response) -> str:
     return detail_s
 
 
+def _transfer_error_text(exc: Exception) -> str:
+    detail = getattr(exc, "detail", None)
+    return str(detail or exc)
+
+
+def _fail_local_transfer(transfer_id: str, exc: Exception) -> None:
+    state.fail_transfer(transfer_id, _transfer_error_text(exc))
+
+
+def _complete_local_transfer(transfer_id: str, action: str) -> dict:
+    info = state.complete_transfer(transfer_id)
+    if info is None:
+        return {}
+    state.add_transfer_log(
+        {
+            "action": action,
+            "source": info["source"],
+            "dest": info["dest"],
+            "ok": True,
+            "files": info["completed_files"],
+            "kind": info["kind"],
+        }
+    )
+    return info
+
+
 def _send_path(src: Path, dest: str, target: str, headers: dict[str, str]) -> dict:
     if src.is_file():
-        try:
-            with _lan_client(timeout=None) as client:
-                with src.open("rb") as f:
-                    resp = client.post(
-                        f"{target}/file",
-                        headers=headers,
-                        files={"file": (src.name, f)},
-                        data={"dest": dest},
-                    )
-                if resp.status_code >= 400:
-                    raise HTTPException(status_code=400, detail=_peer_error(resp))
-        except HTTPException:
-            raise
-        except OSError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except httpx.HTTPError as exc:
-            raise HTTPException(status_code=400, detail=f"Transfer failed: {exc}") from exc
-
-        state.add_transfer_log({"action": "send", "source": str(src), "dest": dest, "ok": True})
-        path_history.remember_paths((str(src), "local"), (dest, "remote"))
-        return {
-            "ok": True,
-            "direction": "send",
-            "kind": "file",
-            "source": str(src),
-            "dest": dest,
-            "files": 1,
-        }
+        return _send_file(src, dest, target, headers)
 
     if not src.is_dir():
         raise HTTPException(status_code=400, detail=f"Source not found: {src}")
 
+    return _send_directory(src, dest, target, headers)
+
+
+def _send_file(src: Path, dest: str, target: str, headers: dict[str, str]) -> dict:
+    try:
+        total_bytes = src.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    transfer_id = state.start_transfer(
+        direction="send",
+        kind="file",
+        source=str(src),
+        dest=dest,
+        total_files=1,
+        total_bytes=total_bytes,
+    )
+    consumed = 0
+
+    def on_read(amount: int) -> None:
+        nonlocal consumed
+        consumed += amount
+        state.update_transfer(
+            transfer_id,
+            completed_bytes=consumed,
+            current_file=src.name,
+        )
+
+    try:
+        request_headers = {
+            **headers,
+            **make_transfer_headers(
+                transfer_id=transfer_id,
+                direction="receive",
+                kind="file",
+                source=str(src),
+                dest=dest,
+                total_files=1,
+                total_bytes=total_bytes,
+                file_index=0,
+                current_file=src.name,
+                final=True,
+            ),
+        }
+        with _lan_client(timeout=None) as client:
+            with src.open("rb") as raw_file:
+                progress_file = ProgressReader(raw_file, on_read)
+                resp = client.post(
+                    f"{target}/file",
+                    headers=request_headers,
+                    files={"file": (src.name, progress_file)},
+                    data={"dest": dest},
+                )
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail=_peer_error(resp))
+    except HTTPException as exc:
+        _fail_local_transfer(transfer_id, exc)
+        raise
+    except OSError as exc:
+        _fail_local_transfer(transfer_id, exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        _fail_local_transfer(transfer_id, exc)
+        raise HTTPException(status_code=400, detail=f"Transfer failed: {exc}") from exc
+
+    info = _complete_local_transfer(transfer_id, "send")
+    path_history.remember_paths((str(src), "local"), (dest, "remote"))
+    return {
+        "ok": True,
+        "direction": "send",
+        "kind": "file",
+        "source": str(src),
+        "dest": dest,
+        "files": info.get("completed_files", 1),
+    }
+
+
+def _send_directory(src: Path, dest: str, target: str, headers: dict[str, str]) -> dict:
     remote_root = normalize_dest_dir(dest, src.name)
     files = iter_local_files(src)
     dirs = iter_local_dirs(src)
+    file_sizes: list[int] = []
+    try:
+        file_sizes = [file_path.stat().st_size for file_path, _ in files]
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    total_bytes = sum(file_sizes)
+    transfer_id = state.start_transfer(
+        direction="send",
+        kind="dir",
+        source=str(src),
+        dest=str(remote_root),
+        total_files=len(files),
+        total_bytes=total_bytes,
+    )
+    completed_bytes = 0
 
     try:
         with _lan_client(timeout=None) as client:
+            root_headers = {
+                **headers,
+                **make_transfer_headers(
+                    transfer_id=transfer_id,
+                    direction="receive",
+                    kind="dir",
+                    source=str(src),
+                    dest=str(remote_root),
+                    total_files=len(files),
+                    total_bytes=total_bytes,
+                    final=not files and not dirs,
+                ),
+            }
             root_resp = client.post(
                 f"{target}/mkdir",
-                headers=headers,
+                headers=root_headers,
                 json={"path": str(remote_root)},
             )
             if root_resp.status_code >= 400:
                 raise HTTPException(status_code=400, detail=_peer_error(root_resp))
 
-            for rel in dirs:
+            for dir_index, rel in enumerate(dirs):
+                dir_headers = {
+                    **headers,
+                    **make_transfer_headers(
+                        transfer_id=transfer_id,
+                        direction="receive",
+                        kind="dir",
+                        source=str(src),
+                        dest=str(remote_root),
+                        total_files=len(files),
+                        total_bytes=total_bytes,
+                        final=not files and dir_index == len(dirs) - 1,
+                    ),
+                }
                 resp = client.post(
                     f"{target}/mkdir",
-                    headers=headers,
+                    headers=dir_headers,
                     json={"path": str(remote_root / rel)},
                 )
                 if resp.status_code >= 400:
                     raise HTTPException(status_code=400, detail=_peer_error(resp))
 
-            for file_path, rel in files:
+            for file_index, ((file_path, rel), file_size) in enumerate(zip(files, file_sizes)):
+                state.update_transfer(
+                    transfer_id,
+                    completed_files=file_index,
+                    completed_bytes=completed_bytes,
+                    current_file=rel,
+                )
+                consumed = 0
+
+                def on_read(amount: int) -> None:
+                    nonlocal consumed
+                    consumed += amount
+                    state.update_transfer(
+                        transfer_id,
+                        completed_bytes=completed_bytes + consumed,
+                        current_file=rel,
+                    )
+
+                request_headers = {
+                    **headers,
+                    **make_transfer_headers(
+                        transfer_id=transfer_id,
+                        direction="receive",
+                        kind="dir",
+                        source=str(src),
+                        dest=str(remote_root),
+                        total_files=len(files),
+                        total_bytes=total_bytes,
+                        file_index=file_index,
+                        completed_bytes=completed_bytes,
+                        current_file=rel,
+                        final=file_index == len(files) - 1,
+                    ),
+                }
                 remote_dest = str(remote_root / rel)
-                with file_path.open("rb") as f:
+                with file_path.open("rb") as raw_file:
+                    progress_file = ProgressReader(raw_file, on_read)
                     resp = client.post(
                         f"{target}/file",
-                        headers=headers,
-                        files={"file": (file_path.name, f)},
+                        headers=request_headers,
+                        files={"file": (file_path.name, progress_file)},
                         data={"dest": remote_dest},
                     )
                 if resp.status_code >= 400:
@@ -435,22 +607,24 @@ def _send_path(src: Path, dest: str, target: str, headers: dict[str, str]) -> di
                         status_code=400,
                         detail=f"{rel}: {_peer_error(resp)}",
                     )
-    except HTTPException:
+                completed_bytes += file_size
+                state.update_transfer(
+                    transfer_id,
+                    completed_files=file_index + 1,
+                    completed_bytes=completed_bytes,
+                    current_file="",
+                )
+    except HTTPException as exc:
+        _fail_local_transfer(transfer_id, exc)
         raise
     except OSError as exc:
+        _fail_local_transfer(transfer_id, exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except httpx.HTTPError as exc:
+        _fail_local_transfer(transfer_id, exc)
         raise HTTPException(status_code=400, detail=f"Transfer failed: {exc}") from exc
 
-    state.add_transfer_log(
-        {
-            "action": "send",
-            "source": str(src),
-            "dest": str(remote_root),
-            "ok": True,
-            "files": len(files),
-        }
-    )
+    info = _complete_local_transfer(transfer_id, "send")
     path_history.remember_paths((str(src), "local"), (str(remote_root), "remote"))
     return {
         "ok": True,
@@ -458,44 +632,92 @@ def _send_path(src: Path, dest: str, target: str, headers: dict[str, str]) -> di
         "kind": "dir",
         "source": str(src),
         "dest": str(remote_root),
-        "files": len(files),
+        "files": info.get("completed_files", len(files)),
         "dirs": len(dirs),
     }
 
 
 def _receive_path(source_path: str, dest: str, target: str, headers: dict[str, str]) -> dict:
+    transfer_id = state.start_transfer(
+        direction="receive",
+        kind="file",
+        source=source_path,
+        dest=dest,
+    )
+    completed_bytes = 0
     try:
         with _lan_client(timeout=None) as client:
+            listing_headers = {
+                **headers,
+                **make_transfer_headers(
+                    transfer_id=transfer_id,
+                    direction="send",
+                    kind="file",
+                    source=source_path,
+                    dest=dest,
+                ),
+            }
             listed = client.get(
                 f"{target}/dir/list",
                 params={"path": source_path},
-                headers=headers,
+                headers=listing_headers,
             )
             if listed.status_code >= 400:
                 raise HTTPException(status_code=400, detail=_peer_error(listed))
             meta = listed.json()
+            if not isinstance(meta, dict):
+                raise ValueError("Peer returned invalid transfer metadata")
 
             if meta.get("kind") == "file":
-                resp = client.get(
-                    f"{target}/file/fetch",
-                    params={"path": source_path},
-                    headers=headers,
+                size_map = meta.get("file_sizes") or {}
+                if not isinstance(size_map, dict):
+                    raise ValueError("Peer returned invalid file size metadata")
+                file_name = Path(source_path).name
+                total_bytes = int(size_map.get(file_name) or meta.get("size") or 0)
+                state.update_transfer(
+                    transfer_id,
+                    kind="file",
+                    total_files=1,
+                    total_bytes=total_bytes,
+                    current_file=file_name,
                 )
-                if resp.status_code >= 400:
-                    raise HTTPException(status_code=400, detail=_peer_error(resp))
                 dest_path = Path(dest).expanduser()
                 if (dest_path.exists() and dest_path.is_dir()) or str(dest).endswith(("/", "\\")):
                     dest_path = dest_path / Path(source_path).name
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
-                dest_path.write_bytes(resp.content)
-                state.add_transfer_log(
-                    {
-                        "action": "receive",
-                        "source": source_path,
-                        "dest": str(dest_path),
-                        "ok": True,
-                    }
-                )
+                request_headers = {
+                    **headers,
+                    **make_transfer_headers(
+                        transfer_id=transfer_id,
+                        direction="send",
+                        kind="file",
+                        source=source_path,
+                        dest=dest,
+                        total_files=1,
+                        total_bytes=total_bytes,
+                        file_index=0,
+                        current_file=file_name,
+                        final=True,
+                    ),
+                }
+                with client.stream(
+                    "GET",
+                    f"{target}/file/fetch",
+                    params={"path": source_path},
+                    headers=request_headers,
+                ) as resp:
+                    if resp.status_code >= 400:
+                        raise HTTPException(status_code=400, detail=_peer_error(resp))
+                    with dest_path.open("wb") as out:
+                        for chunk in resp.iter_bytes(64 * 1024):
+                            out.write(chunk)
+                            completed_bytes += len(chunk)
+                            state.update_transfer(
+                                transfer_id,
+                                completed_bytes=completed_bytes,
+                                current_file=file_name,
+                            )
+                info = _complete_local_transfer(transfer_id, "receive")
                 path_history.remember_paths((source_path, "remote"), (str(dest_path), "local"))
                 return {
                     "ok": True,
@@ -503,49 +725,105 @@ def _receive_path(source_path: str, dest: str, target: str, headers: dict[str, s
                     "kind": "file",
                     "source": source_path,
                     "dest": str(dest_path),
-                    "files": 1,
+                    "files": info.get("completed_files", 1),
                 }
 
-            remote_name = meta.get("name") or Path(source_path).name
+            remote_name = str(meta.get("name") or Path(source_path).name)
+            raw_file_sizes = meta.get("file_sizes") or {}
+            raw_files = meta.get("files") or []
+            raw_dirs = meta.get("dirs") or []
+            if not isinstance(raw_file_sizes, dict):
+                raise ValueError("Peer returned invalid file size metadata")
+            if not isinstance(raw_files, list) or not isinstance(raw_dirs, list):
+                raise ValueError("Peer returned invalid directory metadata")
+            file_sizes = {
+                str(key): max(0, int(value))
+                for key, value in raw_file_sizes.items()
+            }
+            files = [str(rel) for rel in raw_files]
+            dirs = [str(rel) for rel in raw_dirs]
+            total_bytes = sum(file_sizes.get(rel, 0) for rel in files)
+            state.update_transfer(
+                transfer_id,
+                kind="dir",
+                total_files=len(files),
+                total_bytes=total_bytes,
+            )
             local_root = normalize_dest_dir(dest, remote_name)
             local_root.mkdir(parents=True, exist_ok=True)
 
-            for rel in meta.get("dirs") or []:
-                (local_root / rel).mkdir(parents=True, exist_ok=True)
+            for rel in dirs:
+                (local_root / safe_relative_path(rel)).mkdir(parents=True, exist_ok=True)
 
-            files = meta.get("files") or []
             remote_root = Path(meta.get("root") or source_path)
-            for rel in files:
-                remote_file = str(remote_root / rel)
-                resp = client.get(
+            for file_index, rel in enumerate(files):
+                relative_path = safe_relative_path(rel)
+                remote_file = str(remote_root / relative_path)
+                out = local_root / relative_path
+                out.parent.mkdir(parents=True, exist_ok=True)
+                file_size = file_sizes.get(rel, 0)
+                state.update_transfer(
+                    transfer_id,
+                    completed_files=file_index,
+                    completed_bytes=completed_bytes,
+                    current_file=rel,
+                )
+                request_headers = {
+                    **headers,
+                    **make_transfer_headers(
+                        transfer_id=transfer_id,
+                        direction="send",
+                        kind="dir",
+                        source=source_path,
+                        dest=dest,
+                        total_files=len(files),
+                        total_bytes=total_bytes,
+                        file_index=file_index,
+                        completed_bytes=completed_bytes,
+                        current_file=rel,
+                        final=file_index == len(files) - 1,
+                    ),
+                }
+                with client.stream(
+                    "GET",
                     f"{target}/file/fetch",
                     params={"path": remote_file},
-                    headers=headers,
+                    headers=request_headers,
+                ) as resp:
+                    if resp.status_code >= 400:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"{rel}: {_peer_error(resp)}",
+                        )
+                    with out.open("wb") as output:
+                        for chunk in resp.iter_bytes(64 * 1024):
+                            output.write(chunk)
+                            completed_bytes += len(chunk)
+                            state.update_transfer(
+                                transfer_id,
+                                completed_bytes=completed_bytes,
+                                current_file=rel,
+                            )
+                state.update_transfer(
+                    transfer_id,
+                    completed_files=file_index + 1,
+                    completed_bytes=completed_bytes,
+                    current_file="",
                 )
-                if resp.status_code >= 400:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"{rel}: {_peer_error(resp)}",
-                    )
-                out = local_root / rel
-                out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_bytes(resp.content)
-    except HTTPException:
+    except HTTPException as exc:
+        _fail_local_transfer(transfer_id, exc)
         raise
     except OSError as exc:
+        _fail_local_transfer(transfer_id, exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except httpx.HTTPError as exc:
+        _fail_local_transfer(transfer_id, exc)
         raise HTTPException(status_code=400, detail=f"Transfer failed: {exc}") from exc
+    except (TypeError, ValueError) as exc:
+        _fail_local_transfer(transfer_id, exc)
+        raise HTTPException(status_code=400, detail=f"Invalid transfer metadata: {exc}") from exc
 
-    state.add_transfer_log(
-        {
-            "action": "receive",
-            "source": source_path,
-            "dest": str(local_root),
-            "ok": True,
-            "files": len(files),
-        }
-    )
+    info = _complete_local_transfer(transfer_id, "receive")
     path_history.remember_paths((source_path, "remote"), (str(local_root), "local"))
     return {
         "ok": True,
@@ -553,6 +831,6 @@ def _receive_path(source_path: str, dest: str, target: str, headers: dict[str, s
         "kind": "dir",
         "source": source_path,
         "dest": str(local_root),
-        "files": len(files),
-        "dirs": len(meta.get("dirs") or []),
+        "files": info.get("completed_files", len(files)),
+        "dirs": len(dirs),
     }

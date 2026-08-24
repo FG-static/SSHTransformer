@@ -7,7 +7,8 @@
 - 单一程序：本机 Agent + WebUI
 - 主机 / 副机配对（IP + 六位配对码）
 - 剪贴板暂存、读写系统剪贴板、推送到对端
-- 按路径发送 / 拉取文件（macOS 可用系统文件选择器；路径历史会自动记住）
+- 按路径发送 / 拉取文件和文件夹（macOS / Linux 可用系统文件选择器；路径历史会自动记住）
+- 文件和文件夹传输显示实时进度，传输记录会自动更新
 
 ## 要求
 
@@ -16,6 +17,9 @@
 - Linux 系统剪贴板（任选其一）：
   - Wayland：`wl-clipboard`（`wl-copy` / `wl-paste`）
   - X11：`xclip` 或 `xsel`
+- Linux 文件选择器（任选其一，可选）：`zenity`、`kdialog` 或 `yad`
+
+没有安装 Linux 文件选择器时，仍可直接手动填写路径。
 
 ## 安装与启动
 
@@ -54,5 +58,6 @@ Open WebUI →  http://127.0.0.1:8765
 
 - 默认假设两机在同一局域网；跨网请自行用 Tailscale 等组网，主机地址填虚拟网 IP。
 - 系统剪贴板会按平台自动选择：macOS 用 `pbcopy`/`pbpaste`；Linux 优先 `wl-clipboard`，否则 `xclip`/`xsel`。
-- 本机「选择文件/文件夹」目前仅 macOS（通过 Finder 对话框）；Linux 选择器稍后补。路径历史保存在 `~/.sshtransformer/path_history.json`。
+- 本机「选择文件/文件夹」：macOS 通过 Finder；Linux 优先使用 `zenity`、其次 `kdialog` / `yad`。路径历史保存在 `~/.sshtransformer/path_history.json`。
 - 推送：本机可选文件或文件夹；接收：本机只选保存文件夹。对端路径按系统预填默认根目录（macOS → `/Users`，Linux → `/home`）。
+- 文件传输进度和记录默认每秒自动刷新，不需要手动刷新页面。文件夹传输需要两端都运行当前版本，并在更新代码后重启程序。

@@ -9,6 +9,9 @@
   let savedSrcPath = "";
   let savedDestPath = "";
   let pollTimer = null;
+  let transferPollTimer = null;
+  let transferPollBusy = false;
+  const transferProgresses = new Map();
   let toastTimer = null;
 
   function basename(path) {
@@ -41,6 +44,89 @@
 
   function datalistOptions(paths) {
     return (paths || []).map((p) => `<option value="${escapeHtml(p)}"></option>`).join("");
+  }
+
+  function formatBytes(value) {
+    const bytes = Number(value || 0);
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+
+  function transferLabel(task) {
+    const direction = task.direction === "send" ? "发送" : "接收";
+    const kind = task.kind === "dir" ? "文件夹" : "文件";
+    return `${direction}${kind}`;
+  }
+
+  function transferStatusLabel(task) {
+    if (task.status === "completed") return "已完成";
+    if (task.status === "failed") return "失败";
+    return "传输中";
+  }
+
+  function updateTransferPanel(s) {
+    const progressEl = document.getElementById("transfer-progress");
+    const logEl = document.getElementById("transfer-log");
+    if (!progressEl || !logEl) return;
+
+    const tasks = (s.transfers || []).slice(0, 8);
+    const visibleIds = new Set(tasks.map((task) => task.id));
+    for (const id of transferProgresses.keys()) {
+      if (!visibleIds.has(id)) transferProgresses.delete(id);
+    }
+    progressEl.innerHTML = tasks.length
+      ? tasks
+          .map((task) => {
+            const progress = Math.max(0, Math.min(100, Number(task.progress || 0)));
+            const previousProgress = transferProgresses.get(task.id);
+            const initialProgress =
+              previousProgress === undefined ? 0 : Math.min(previousProgress, progress);
+            transferProgresses.set(task.id, progress);
+            const count = task.total_files
+              ? `${task.completed_files || 0}/${task.total_files} 个文件`
+              : `${formatBytes(task.completed_bytes)} / ${formatBytes(task.total_bytes)}`;
+            const current = task.current_file ? ` · ${task.current_file}` : "";
+            const error = task.error
+              ? `<div class="transfer-error">${escapeHtml(task.error)}</div>`
+              : "";
+            return `
+              <div class="transfer-task ${escapeHtml(task.status || "running")}">
+                <div class="transfer-task-head">
+                  <span>${escapeHtml(transferLabel(task))} · ${escapeHtml(task.source || "")}</span>
+                  <strong>${progress}%</strong>
+                </div>
+                <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}">
+                  <div class="progress-bar" data-target-width="${progress}" style="width:${initialProgress}%"></div>
+                </div>
+                <div class="transfer-task-meta">${escapeHtml(transferStatusLabel(task))} · ${escapeHtml(count)}${escapeHtml(current)}</div>
+                ${error}
+              </div>
+            `;
+          })
+          .join("")
+      : `<div class="transfer-empty">暂无传输任务</div>`;
+
+    requestAnimationFrame(() => {
+      progressEl.querySelectorAll(".progress-bar[data-target-width]").forEach((bar) => {
+        bar.style.width = `${bar.dataset.targetWidth}%`;
+      });
+    });
+
+    const logs = (s.transfer_log || []).slice().reverse();
+    logEl.innerHTML = logs.length
+      ? logs
+          .map((item) => {
+            const label = item.action === "send" ? "发送" : item.action === "receive" ? "接收" : item.action;
+            const count =
+              typeof item.files === "number" && item.files > 1
+                ? ` · ${item.files} 个文件`
+                : "";
+            return `<li>${escapeHtml(label)} · ${escapeHtml(item.source || item.name || "")} → ${escapeHtml(item.dest || "")}${escapeHtml(count)}</li>`;
+          })
+          .join("")
+      : "<li>暂无传输记录</li>";
   }
 
   async function api(path, options = {}) {
@@ -307,7 +393,6 @@
   }
 
   function renderReady(s) {
-    const logs = (s.transfer_log || []).slice().reverse();
     const hist = s.path_history || { local: [], remote: [], all: [] };
     const remoteRoot = s.remote_default_root || "/tmp";
     const localDir = s.local_default_dir || s.local_home || "";
@@ -317,6 +402,9 @@
     const destIsLocal = !sending;
     const srcHist = srcIsLocal ? hist.local : hist.remote;
     const destHist = destIsLocal ? hist.local : hist.remote;
+    const pickerAvailable = Boolean(s.picker_available);
+    const pickerUnavailable =
+      `<p class="hint">当前系统没有可用的文件选择器，请手动填写路径；Linux 可安装 zenity、kdialog 或 yad。</p>`;
 
     const srcPlaceholder = sending
       ? `${localDir || "/Users/you"}/Desktop/notes.txt`
@@ -325,17 +413,21 @@
       ? `${remoteRoot}/notes.txt`
       : `${localDir || "/Users/you"}/notes.txt`;
 
-    const srcActions = srcIsLocal
+    const srcActions = srcIsLocal && pickerAvailable
       ? `<div class="path-actions">
            <button class="btn btn-accent btn-compact" id="src-browse-file" type="button">选择文件…</button>
            <button class="btn btn-ghost btn-compact" id="src-browse-folder" type="button">选择文件夹…</button>
          </div>`
+      : srcIsLocal
+        ? pickerUnavailable
       : `<p class="hint">对端路径请手动填写，或从下方历史记录选择</p>`;
 
-    const destActions = destIsLocal
+    const destActions = destIsLocal && pickerAvailable
       ? `<div class="path-actions">
            <button class="btn btn-accent btn-compact" id="dest-browse-folder" type="button">选择文件夹…</button>
          </div>`
+      : destIsLocal
+        ? pickerUnavailable
       : "";
 
     app.innerHTML = `
@@ -387,22 +479,8 @@
             <button class="btn btn-accent" id="btn-transfer" type="button">开始传输</button>
             <button class="btn btn-ghost" id="btn-disconnect" type="button">断开</button>
           </div>
-          <ul class="log-list">
-            ${
-              logs.length
-                ? logs
-                    .map((item) => {
-                      const label = item.action === "send" ? "发送" : "接收";
-                      const count =
-                        typeof item.files === "number" && item.files > 1
-                          ? ` · ${item.files} 个文件`
-                          : "";
-                      return `<li>${escapeHtml(label)} · ${escapeHtml(item.source || item.name || "")} → ${escapeHtml(item.dest || "")}${escapeHtml(count)}</li>`;
-                    })
-                    .join("")
-                : "<li>暂无传输记录</li>"
-            }
-          </ul>
+          <div id="transfer-progress" class="transfer-progress"></div>
+          <ul id="transfer-log" class="log-list"></ul>
         </div>
       </section>
     `;
@@ -422,6 +500,7 @@
       savedSrcPath = srcEl.value;
       savedDestPath = destEl.value;
     };
+    updateTransferPanel(s);
     srcEl.addEventListener("input", persistPaths);
     destEl.addEventListener("input", persistPaths);
 
@@ -625,6 +704,20 @@
     renderRole();
   }
 
+  async function refreshTransfers() {
+    if (transferPollBusy || !status?.connected) return;
+    transferPollBusy = true;
+    try {
+      const next = await api("/transfers");
+      status = { ...status, ...next };
+      updateTransferPanel(status);
+    } catch {
+      /* ignore transient transfer-poll errors */
+    } finally {
+      transferPollBusy = false;
+    }
+  }
+
   async function refresh() {
     try {
       const next = await api("/status");
@@ -646,6 +739,7 @@
       } else if (next.connected && prevPhase !== "ready") {
         render();
       }
+      if (next.connected) updateTransferPanel(next);
     } catch {
       /* ignore transient poll errors */
     }
@@ -656,6 +750,7 @@
     selectedIp = status.selected_ip || (status.ips && status.ips[0]) || "";
     render();
     pollTimer = setInterval(refresh, 1500);
+    transferPollTimer = setInterval(refreshTransfers, 1000);
   }
 
   boot().catch((err) => {

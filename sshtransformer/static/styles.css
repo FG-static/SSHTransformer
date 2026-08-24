@@ -8,8 +8,10 @@
   --line: rgba(20, 32, 28, 0.1);
   --teal: #0f7a6c;
   --teal-bright: #14a392;
+  --accent: var(--teal);
   --amber: #c47a1a;
   --rose: #b84343;
+  --danger: var(--rose);
   --shadow: 0 24px 60px rgba(20, 32, 28, 0.12);
   --radius: 22px;
   --font-display: "Syne", sans-serif;
@@ -593,6 +595,73 @@ button.btn:disabled {
   font-size: 0.78rem;
   color: var(--ink-soft);
   line-height: 1.4;
+}
+
+.transfer-progress {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 1rem;
+}
+
+.transfer-task {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, var(--panel) 88%, var(--accent) 12%);
+}
+
+.transfer-task.completed {
+  opacity: 0.78;
+}
+
+.transfer-task.failed {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--line));
+}
+
+.transfer-task-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  min-width: 0;
+  font-size: 0.82rem;
+}
+
+.transfer-task-head span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progress-track {
+  height: 0.42rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--line);
+}
+
+.progress-bar {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 850ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: width;
+}
+
+.transfer-task.failed .progress-bar {
+  background: var(--danger);
+}
+
+.transfer-task-meta,
+.transfer-empty,
+.transfer-error {
+  font-size: 0.76rem;
+  color: var(--ink-soft);
+}
+
+.transfer-error {
+  color: var(--danger);
 }
 
 .dir-toggle {

@@ -1,9 +1,11 @@
-"""Native file/folder picker. macOS first; Linux later."""
+"""Native file/folder picker for macOS and common Linux desktops."""
 
 from __future__ import annotations
 
 import platform
+import shutil
 import subprocess
+from pathlib import Path
 
 
 class PickerError(RuntimeError):
@@ -15,7 +17,12 @@ class PickerCancelled(Exception):
 
 
 def picker_available() -> bool:
-    return platform.system() == "Darwin"
+    system = platform.system()
+    if system == "Darwin":
+        return shutil.which("osascript") is not None
+    if system == "Linux":
+        return any(shutil.which(command) for command in ("zenity", "kdialog", "yad"))
+    return False
 
 
 def pick_path(kind: str) -> str:
@@ -30,7 +37,58 @@ def pick_path(kind: str) -> str:
     system = platform.system()
     if system == "Darwin":
         return _mac_pick(kind)
-    raise PickerError("本机文件选择器暂仅支持 macOS，Linux 版稍后提供")
+    if system == "Linux":
+        return _linux_pick(kind)
+    raise PickerError(f"暂不支持 {system} 系统的文件选择器")
+
+
+def _linux_pick(kind: str) -> str:
+    """Use the first available GTK/KDE desktop picker on Linux."""
+    if shutil.which("zenity"):
+        command = [
+            "zenity",
+            "--file-selection",
+            "--title=选择要传输的文件" if kind == "file" else "--title=选择文件夹",
+        ]
+        if kind == "folder":
+            command.append("--directory")
+    elif shutil.which("kdialog"):
+        title = "选择要传输的文件" if kind == "file" else "选择文件夹"
+        command = ["kdialog", "--title", title]
+        command.extend(
+            ["--getopenfilename", str(Path.home()), "*"]
+            if kind == "file"
+            else ["--getexistingdirectory", str(Path.home())]
+        )
+    elif shutil.which("yad"):
+        title = "选择要传输的文件" if kind == "file" else "选择文件夹"
+        command = ["yad", "--file-selection", f"--title={title}"]
+        if kind == "folder":
+            command.append("--directory")
+    else:
+        raise PickerError(
+            "未找到 Linux 文件选择器，请安装 zenity、kdialog 或 yad。"
+        )
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PickerError("选择超时，请重试") from exc
+    except OSError as exc:
+        raise PickerError(f"无法启动文件选择器: {exc}") from exc
+
+    path = (result.stdout or "").strip()
+    if path:
+        return path
+    if result.returncode in {0, 1}:
+        raise PickerCancelled()
+    detail = (result.stderr or "").strip() or f"picker exit {result.returncode}"
+    raise PickerError(f"Linux 文件选择器失败（{detail}）")
 
 
 def _mac_pick(kind: str) -> str:
