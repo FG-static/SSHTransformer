@@ -90,6 +90,27 @@ def peer_info(authorization: str | None = Header(default=None)) -> dict:
     return state.snapshot()
 
 
+@router.post("/peer-disconnect")
+def peer_disconnect(authorization: str | None = Header(default=None)) -> dict:
+    """Peer told us it is leaving; drop the link and return to the previous screen."""
+    _require_token(authorization)
+    import secrets
+
+    with state._lock:
+        was_host = state.role == Role.HOST
+        state.peer = None
+        state.peer_base_url = ""
+        state.last_error = ""
+        if was_host:
+            state.phase = Phase.WAITING
+            state.pairing_code = f"{secrets.randbelow(1_000_000):06d}"
+            state.session_token = secrets.token_urlsafe(24)
+        else:
+            state.phase = Phase.ROLE
+            state.session_token = ""
+    return {"ok": True}
+
+
 @router.get("/clipboard")
 def get_clipboard(authorization: str | None = Header(default=None)) -> dict:
     _require_token(authorization)

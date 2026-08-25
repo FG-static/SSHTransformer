@@ -723,7 +723,11 @@
       const next = await api("/status");
       const prevPhase = status?.phase;
       const prevPeer = status?.peer?.hostname;
+      const wasConnected = !!status?.connected;
       status = next;
+      if (wasConnected && !next.connected) {
+        toast("对端已断开连接");
+      }
       if (
         !document.activeElement ||
         !["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)

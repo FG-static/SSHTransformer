@@ -207,9 +207,29 @@ def connect_guest(body: ConnectBody) -> dict:
     return enriched_status()
 
 
+def _notify_peer_disconnect(target: str, token: str) -> None:
+    """Best-effort: tell the peer we are leaving so it can reset its screen too."""
+    if not target or not token:
+        return
+    try:
+        with _lan_client(timeout=3.0) as client:
+            client.post(
+                f"{target}/peer-disconnect",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except httpx.HTTPError:
+        pass
+
+
 @router.post("/disconnect")
 def disconnect() -> dict:
     """Drop peer link. Host returns to waiting with a fresh code; guest returns to connect form."""
+    with state._lock:
+        target = state.peer_base_url
+        token = state.session_token
+
+    _notify_peer_disconnect(target, token)
+
     with state._lock:
         was_host = state.role == Role.HOST
         state.peer = None
