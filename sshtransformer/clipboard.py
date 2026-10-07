@@ -5,6 +5,11 @@ from __future__ import annotations
 import platform
 import shutil
 import subprocess
+import threading
+
+# Clipboard tools that keep running in the background to own the selection.
+_BACKGROUND: list[subprocess.Popen] = []
+_BACKGROUND_LOCK = threading.Lock()
 
 
 class ClipboardError(RuntimeError):
@@ -31,32 +36,104 @@ def write_clipboard(text: str) -> None:
     raise ClipboardError(f"Unsupported system for clipboard: {system}")
 
 
+_LINUX_READ_COMMANDS = (
+    ["wl-paste", "--no-newline"],
+    ["xclip", "-selection", "clipboard", "-o"],
+    ["xsel", "--clipboard", "--output"],
+)
+
+_LINUX_WRITE_COMMANDS = (
+    ["wl-copy"],
+    ["xclip", "-selection", "clipboard"],
+    ["xsel", "--clipboard", "--input"],
+)
+
+_NO_TOOL_HINT = (
+    "No clipboard tool found. Install wl-clipboard (Wayland) or xclip/xsel (X11)."
+)
+
+
 def _linux_read() -> str:
-    # Wayland first, then X11 tools.
-    for cmd in (
-        ["wl-paste", "--no-newline"],
-        ["xclip", "-selection", "clipboard", "-o"],
-        ["xsel", "--clipboard", "--output"],
-    ):
-        if shutil.which(cmd[0]):
+    # Try every installed tool; the first one that works wins, so a Wayland
+    # tool present in an X11 session (or vice versa) does not break the read.
+    errors: list[str] = []
+    for cmd in _LINUX_READ_COMMANDS:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
             return _run_out(cmd)
-    raise ClipboardError(
-        "No clipboard tool found. Install wl-clipboard (Wayland) or xclip/xsel (X11)."
-    )
+        except ClipboardError as exc:
+            errors.append(f"{cmd[0]}: {exc}")
+    raise ClipboardError("; ".join(errors) if errors else _NO_TOOL_HINT)
 
 
 def _linux_write(text: str) -> None:
-    for cmd in (
-        ["wl-copy"],
-        ["xclip", "-selection", "clipboard"],
-        ["xsel", "--clipboard", "--input"],
-    ):
-        if shutil.which(cmd[0]):
-            _run_in(cmd, text)
+    errors: list[str] = []
+    for cmd in _LINUX_WRITE_COMMANDS:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            _spawn_selection_owner(cmd, text)
             return
-    raise ClipboardError(
-        "No clipboard tool found. Install wl-clipboard (Wayland) or xclip/xsel (X11)."
-    )
+        except ClipboardError as exc:
+            errors.append(f"{cmd[0]}: {exc}")
+    raise ClipboardError("; ".join(errors) if errors else _NO_TOOL_HINT)
+
+
+def _spawn_selection_owner(cmd: list[str], text: str) -> None:
+    """Feed text to a clipboard tool without waiting on its background owner.
+
+    wl-copy / xclip fork a child that keeps serving the clipboard and
+    inherits our stdio pipes; waiting for those pipes to close would block
+    until something else takes the clipboard. So write stdin, close it, and
+    wait only briefly for the direct child: a quick nonzero exit means the
+    tool failed (try the next one), a lingering process means the clipboard
+    is now being served.
+    """
+    _prune_background()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise ClipboardError(f"{cmd[0]}: {exc}") from exc
+
+    try:
+        proc.stdin.write(text.encode("utf-8"))
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass  # Tool bailed out early; the exit status below reports it.
+    except OSError as exc:
+        proc.kill()
+        proc.wait()
+        proc.stderr.close()
+        raise ClipboardError(f"{cmd[0]}: {exc}") from exc
+
+    try:
+        code = proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        # Still running: it owns the clipboard now. Leave it be.
+        with _BACKGROUND_LOCK:
+            _BACKGROUND.append(proc)
+        proc.stderr.close()
+        return
+
+    if code != 0:
+        # The tool failed, so it forked no background child and stderr EOF
+        # is already here — safe to read. Never read it on success: the
+        # forked owner inherits the pipe and read() would block forever.
+        err = proc.stderr.read().decode("utf-8", "replace").strip()
+        proc.stderr.close()
+        raise ClipboardError(err or f"{cmd[0]} exited with {code}")
+    proc.stderr.close()
+
+
+def _prune_background() -> None:
+    with _BACKGROUND_LOCK:
+        _BACKGROUND[:] = [proc for proc in _BACKGROUND if proc.poll() is None]
 
 
 def _run_out(cmd: list[str]) -> str:
