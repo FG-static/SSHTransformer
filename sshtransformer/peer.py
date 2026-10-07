@@ -22,6 +22,7 @@ class PairRequest(BaseModel):
     hostname: str = ""
     os: str = ""
     ip: str = ""
+    peer_port: int = 0  # Guest's own peer port; 0 = legacy guest on 18765.
 
 
 class PairResponse(BaseModel):
@@ -59,13 +60,14 @@ def pair(body: PairRequest, request: Request) -> PairResponse:
             raise HTTPException(status_code=403, detail="Invalid pairing code")
 
         client_ip = (body.ip or "").strip() or (request.client.host if request.client else "")
+        client_port = body.peer_port if body.peer_port > 0 else 18765
         state.peer = PeerInfo(
             hostname=body.hostname or "guest",
             os=body.os or "unknown",
             ip=client_ip,
             role=Role.GUEST.value,
         )
-        state.peer_base_url = f"http://{client_ip}:{18765}" if client_ip else ""
+        state.peer_base_url = f"http://{client_ip}:{client_port}" if client_ip else ""
         state.phase = Phase.READY
         state.last_error = ""
         token = state.session_token
@@ -73,6 +75,8 @@ def pair(body: PairRequest, request: Request) -> PairResponse:
         local = state.local
 
     identity = local_identity()
+    with state._lock:
+        local_peer_port = state.local_peer_port
     return PairResponse(
         token=token,
         host={
@@ -81,6 +85,7 @@ def pair(body: PairRequest, request: Request) -> PairResponse:
             "ip": selected_ip,
             "role": Role.HOST.value,
         },
+        peer_port=local_peer_port,
     )
 
 
@@ -156,6 +161,9 @@ async def receive_file(
             total_bytes=context["total_bytes"],
         )
     dest_path = Path(dest).expanduser()
+    # A directory destination means "into this folder" — append the filename.
+    if dest_path.is_dir() or str(dest).endswith(("/", "\\")):
+        dest_path = dest_path / (file.filename or dest_path.name or "received_file")
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         with dest_path.open("wb") as out:

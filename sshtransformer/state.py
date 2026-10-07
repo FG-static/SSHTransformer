@@ -88,6 +88,7 @@ class SessionState:
     pairing_code: str = ""
     session_token: str = ""
     selected_ip: str = ""
+    local_peer_port: int = 18765
     local: PeerInfo = field(default_factory=PeerInfo)
     peer: PeerInfo | None = None
     peer_base_url: str = ""

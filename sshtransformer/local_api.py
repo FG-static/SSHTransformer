@@ -145,7 +145,11 @@ def choose_role(body: RoleBody) -> dict:
 @router.post("/connect")
 def connect_guest(body: ConnectBody) -> dict:
     identity = local_identity()
-    host = body.host.strip().split("://")[-1].split("/")[0].split(":")[0]
+    # Optional ":port" suffix targets a host whose peer server is not on the
+    # default port; the port is remembered in host history for reconnects.
+    raw_host = body.host.strip().split("://")[-1].split("/")[0]
+    host, _, port_s = raw_host.partition(":")
+    host_port = int(port_s) if port_s.isdigit() and 0 < int(port_s) < 65536 else PEER_PORT
     if not host:
         raise HTTPException(status_code=400, detail="Host IP required")
 
@@ -163,7 +167,7 @@ def connect_guest(body: ConnectBody) -> dict:
             role=Role.GUEST.value,
         )
 
-    url = f"http://{host}:{PEER_PORT}/pair"
+    url = f"http://{host}:{host_port}/pair"
     try:
         with _lan_client(timeout=8.0) as client:
             resp = client.post(
@@ -173,6 +177,7 @@ def connect_guest(body: ConnectBody) -> dict:
                     "hostname": identity["hostname"],
                     "os": identity["os"],
                     "ip": guest_ip,
+                    "peer_port": state.local_peer_port,
                 },
             )
             if resp.status_code >= 400:
@@ -188,12 +193,12 @@ def connect_guest(body: ConnectBody) -> dict:
         with state._lock:
             state.phase = Phase.ERROR
             state.last_error = f"Cannot reach host: {exc}"
-        raise HTTPException(status_code=400, detail=f"Cannot reach host at {host}:{PEER_PORT}") from exc
+        raise HTTPException(status_code=400, detail=f"Cannot reach host at {url}") from exc
 
     host_info = data.get("host") or {}
     with state._lock:
         state.session_token = data["token"]
-        state.peer_base_url = f"http://{host}:{PEER_PORT}"
+        state.peer_base_url = f"http://{host}:{host_port}"
         state.peer = PeerInfo(
             hostname=host_info.get("hostname", "host"),
             os=host_info.get("os", ""),
@@ -203,7 +208,7 @@ def connect_guest(body: ConnectBody) -> dict:
         state.phase = Phase.READY
         state.last_error = ""
 
-    path_history.remember_host(host)
+    path_history.remember_host(raw_host)
     return enriched_status()
 
 
